@@ -164,3 +164,69 @@ func TestDeleteMessageRollsBackDependentDeletesWhenMessageDeleteFails(t *testing
 		})
 	}
 }
+
+// The general cleanups (chat, chat by device, device data, truncate) do not
+// read chatwoot_config_id: the target's config 0 and config 11 links go together,
+// while controls outside the target remain.
+func TestGeneralDeletesRemoveChatwootLinksOfEveryConfig(t *testing.T) {
+	const (
+		deviceA = "device-a@s.whatsapp.net"
+		deviceB = "device-b@s.whatsapp.net"
+		chatA   = "peer-a@s.whatsapp.net"
+		chatB   = "peer-b@s.whatsapp.net"
+	)
+	tests := []struct {
+		name string
+		run  func(repo *SQLiteRepository) error
+		want []string
+	}{
+		{
+			name: "DeleteChat",
+			run:  func(repo *SQLiteRepository) error { return repo.DeleteChat(chatA) },
+			want: []string{deviceA + " WA-OTHER-CHAT"},
+		},
+		{
+			name: "DeleteChatByDevice",
+			run:  func(repo *SQLiteRepository) error { return repo.DeleteChatByDevice(deviceA, chatA) },
+			want: []string{deviceA + " WA-OTHER-CHAT", deviceB + " WA-OTHER-DEVICE"},
+		},
+		{
+			name: "DeleteDeviceData",
+			run:  func(repo *SQLiteRepository) error { return repo.DeleteDeviceData(deviceA) },
+			want: []string{deviceB + " WA-OTHER-DEVICE"},
+		},
+		{
+			name: "TruncateAllChats",
+			run:  func(repo *SQLiteRepository) error { return repo.TruncateAllChats() },
+			want: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newTestSQLiteRepository(t)
+			for _, link := range []*domainChatStorage.ChatwootMessageLink{
+				{DeviceID: deviceA, WhatsAppMessageID: "WA-CFG0", WhatsAppChatJID: chatA, ChatwootMessageID: 40, ChatwootConversationID: 7, ChatwootInboxID: 5, ChatwootAccountID: 3, ChatwootConfigID: 0},
+				{DeviceID: deviceA, WhatsAppMessageID: "WA-CFG11", WhatsAppChatJID: chatA, ChatwootMessageID: 42, ChatwootConversationID: 7, ChatwootInboxID: 5, ChatwootAccountID: 3, ChatwootConfigID: 11},
+				{DeviceID: deviceB, WhatsAppMessageID: "WA-OTHER-DEVICE", WhatsAppChatJID: chatA, ChatwootMessageID: 43, ChatwootConversationID: 8, ChatwootInboxID: 5, ChatwootAccountID: 3, ChatwootConfigID: 22},
+				{DeviceID: deviceA, WhatsAppMessageID: "WA-OTHER-CHAT", WhatsAppChatJID: chatB, ChatwootMessageID: 44, ChatwootConversationID: 9, ChatwootInboxID: 5, ChatwootAccountID: 3, ChatwootConfigID: 0},
+			} {
+				require.NoError(t, repo.UpsertChatwootMessageLink(link))
+			}
+
+			require.NoError(t, tc.run(repo))
+
+			rows, err := repo.db.Query(`SELECT device_id, wa_message_id FROM chatwoot_message_links ORDER BY device_id, wa_message_id`)
+			require.NoError(t, err)
+			defer rows.Close()
+			remaining := []string{}
+			for rows.Next() {
+				var deviceID, waMessageID string
+				require.NoError(t, rows.Scan(&deviceID, &waMessageID))
+				remaining = append(remaining, deviceID+" "+waMessageID)
+			}
+			require.NoError(t, rows.Err())
+			require.Equal(t, tc.want, remaining)
+		})
+	}
+}

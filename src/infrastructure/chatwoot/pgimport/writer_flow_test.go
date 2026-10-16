@@ -245,6 +245,114 @@ func TestImportChat_IdempotentSkip(t *testing.T) {
 	}
 }
 
+// TestImportChat_LinksStayLegacyScoped pins the scope of the links returned in
+// ImportResult: the importer is legacy-only, so it leaves the config id at
+// 0 and stamps its own account and inbox, for both freshly written and
+// already-present rows. The parent sync persists these links as returned.
+func TestImportChat_LinksStayLegacyScoped(t *testing.T) {
+	const (
+		jid       = "peer-a@s.whatsapp.net"
+		deviceID  = "device-a@s.whatsapp.net"
+		waID      = "WA-IMPORTED"
+		sourceID  = "WAID:" + waID
+		contactID = 100
+		convID    = 7
+		cwMsgID   = 909
+	)
+	ts := time.Date(2026, 5, 9, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		present     bool
+		wantWrote   int
+		wantSkipped int
+	}{
+		{name: "written", present: false, wantWrote: 1},
+		{name: "already present", present: true, wantSkipped: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			imp, mock, cleanup := newUpsertContactTestImporter(t)
+			defer cleanup()
+			imp.accountID = 3
+			imp.inboxID = 5
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta(upsertContactByJIDSQL)).
+				WithArgs(3, jid).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(contactID))
+			mock.ExpectQuery(regexp.QuoteMeta(selectContactInboxSQL)).
+				WithArgs(contactID, 5).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(200))
+			mock.ExpectQuery(regexp.QuoteMeta(selectConversationSQL)).
+				WithArgs(3, 5, contactID).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(convID, conversationStatusOpen))
+			mock.ExpectExec(regexp.QuoteMeta("SAVEPOINT cw_msg")).WillReturnResult(sqlmock.NewResult(0, 0))
+			probe := mock.ExpectQuery(regexp.QuoteMeta(idempotencyProbeSQL)).WithArgs(5, sourceID)
+			if tc.present {
+				probe.WillReturnRows(sqlmock.NewRows([]string{"id", "conversation_id"}).AddRow(cwMsgID, convID))
+			} else {
+				probe.WillReturnError(noRowsError())
+				mock.ExpectQuery(`INSERT INTO messages`).
+					WithArgs("hi", 3, 5, convID, messageTypeIncoming, ts, messageStatusDelivered,
+						sourceID, contentTypeText, senderTypeContact, int64(contactID), sqlmock.AnyArg()).
+					WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(cwMsgID))
+			}
+			mock.ExpectExec(regexp.QuoteMeta("RELEASE SAVEPOINT cw_msg")).WillReturnResult(sqlmock.NewResult(0, 0))
+			if !tc.present {
+				mock.ExpectExec(regexp.QuoteMeta(touchConversationSQL)).
+					WithArgs(convID, ts).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			mock.ExpectCommit()
+
+			res, err := imp.ImportChat(context.Background(), ImportChatRequest{
+				ChatJID:  jid,
+				ChatName: "Peer A",
+				Messages: []*domainChatStorage.Message{{
+					ID:        waID,
+					DeviceID:  deviceID,
+					ChatJID:   jid,
+					Content:   "hi",
+					Timestamp: ts,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("ImportChat: %v", err)
+			}
+			if res.MessagesWrote != tc.wantWrote || res.MessagesSkipped != tc.wantSkipped || res.MessagesFailed != 0 {
+				t.Fatalf("res = %+v, want wrote=%d skipped=%d failed=0", res, tc.wantWrote, tc.wantSkipped)
+			}
+			if len(res.Links) != 1 {
+				t.Fatalf("links = %+v, want exactly one", res.Links)
+			}
+			got := res.Links[0]
+			if got.ChatwootConfigID != 0 || got.ChatwootAccountID != 3 {
+				t.Fatalf("link config=%d account=%d, want 0/3", got.ChatwootConfigID, got.ChatwootAccountID)
+			}
+			want := domainChatStorage.ChatwootMessageLink{
+				DeviceID:                     deviceID,
+				WhatsAppMessageID:            waID,
+				WhatsAppChatJID:              jid,
+				ChatwootMessageID:            cwMsgID,
+				ChatwootConversationID:       convID,
+				ChatwootInboxID:              5,
+				ChatwootContactInboxSourceID: jid,
+				SourceID:                     sourceID,
+				Direction:                    "incoming",
+				ChatwootConfigID:             0,
+				ChatwootAccountID:            3,
+			}
+			if got != want {
+				t.Fatalf("link = %+v, want %+v", got, want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
 func TestImportChat_PerMessageFailureCountedNotFatal(t *testing.T) {
 	// A single message INSERT failure rolls back only that row's savepoint and
 	// is counted as MessagesFailed; the loop continues. Here msg1 fails and

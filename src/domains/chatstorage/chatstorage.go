@@ -97,6 +97,21 @@ type ChatwootMessageLink struct {
 	ChatwootAccountID int `db:"chatwoot_account_id"`
 }
 
+// ChatwootReplyLinkFilter scopes the lookup of the link behind a Chatwoot
+// message that an agent reply quotes. Every field is an equality predicate:
+// ChatwootConfigID 0 matches only legacy/env links, never any config. Account
+// id 0 rows match only when AllowLegacyAccountZero is set and ChatwootConfigID
+// is 0 (confirmed legacy single-account mode).
+type ChatwootReplyLinkFilter struct {
+	DeviceID               string
+	ChatwootMessageID      int
+	ChatwootConversationID int
+	ChatwootAccountID      int
+	ChatwootInboxID        int
+	ChatwootConfigID       int64
+	AllowLegacyAccountZero bool
+}
+
 // ChatwootDeviceConfig is the per-device Chatwoot destination (URL + account +
 // inbox + token). It enables routing each WhatsApp device to its own Chatwoot
 // inbox. DeviceID is the user-facing device id; DeviceJID mirrors the WhatsApp

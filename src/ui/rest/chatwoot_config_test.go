@@ -1,6 +1,8 @@
 package rest
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/middleware"
 	"github.com/gofiber/fiber/v3"
 )
@@ -395,4 +398,130 @@ func TestChatwootConfigMultiDeviceNoDeviceMiddlewareLeak(t *testing.T) {
 			t.Fatalf("expected leaked middleware to reject with DEVICE_ID_REQUIRED, got status=%d body=%s", resp.StatusCode, body)
 		}
 	})
+}
+
+// assertReplyEnvConfig checks the stored config 11 of slot-a field by field.
+func assertReplyEnvConfig(t *testing.T, env *replyEnv, wantURL, wantToken string) {
+	t.Helper()
+	cfg, err := env.base.GetChatwootDeviceConfig(replyTestSlot)
+	if err != nil || cfg == nil {
+		t.Fatalf("stored config = %+v, err = %v; want config 11", cfg, err)
+	}
+	if cfg.ID != 11 || cfg.ChatwootURL != wantURL || cfg.AccountID != 3 || cfg.InboxID != 5 || cfg.APIToken != wantToken || !cfg.Enabled {
+		t.Fatalf("stored config = {id %d url %q account %d inbox %d enabled %v}, want {11 %q 3 5 true} with token %q",
+			cfg.ID, cfg.ChatwootURL, cfg.AccountID, cfg.InboxID, cfg.Enabled, wantURL, wantToken)
+	}
+}
+
+// The reconfiguration guard counts the reply link the webhook itself wrote
+// under config 11, in real SQLite, with only a legacy link (config 0) beside it
+// and no forwarded link. Every PUT that changes URL, account or inbox is a 409
+// CONFIG_HAS_LINKED_CONVERSATIONS that keeps the stored values; rotating only
+// the token is a 200 that keeps the config id and the reply link.
+func TestChatwootConfigRoutingEditBlockedByWebhookReplyLink(t *testing.T) {
+	env := newReplyEnv(t, true)
+	env.seedLink(legacyConversationLink())
+	if reply := env.createReply("/chatwoot/webhook"); reply.ChatwootConfigID != 11 {
+		t.Fatalf("reply link = %+v, want config 11", reply)
+	}
+	if n11, n0 := env.countByConfig(11), env.countByConfig(0); n11 != 1 || n0 != 1 {
+		t.Fatalf("Count(11) = %d, Count(0) = %d; want 1 and 1", n11, n0)
+	}
+	storedURL := env.server.URL
+	const path = "/devices/" + replyTestSlot + "/chatwoot/config"
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"url", fmt.Sprintf(`{"chatwoot_url":%q,"account_id":3,"inbox_id":5}`, storedURL+"/other")},
+		{"account", fmt.Sprintf(`{"chatwoot_url":%q,"account_id":4,"inbox_id":5}`, storedURL)},
+		{"inbox", fmt.Sprintf(`{"chatwoot_url":%q,"account_id":3,"inbox_id":6}`, storedURL)},
+	} {
+		t.Run("changing "+tc.name, func(t *testing.T) {
+			status, body := env.request(http.MethodPut, path, tc.body)
+			var resp utils.ResponseData
+			if err := json.Unmarshal([]byte(body), &resp); err != nil {
+				t.Fatalf("decode %q: %v", body, err)
+			}
+			if status != fiber.StatusConflict || resp.Code != "CONFIG_HAS_LINKED_CONVERSATIONS" {
+				t.Fatalf("status = %d code = %q, want 409 CONFIG_HAS_LINKED_CONVERSATIONS", status, resp.Code)
+			}
+			assertReplyEnvConfig(t, env, storedURL, "token-a")
+		})
+	}
+
+	t.Run("rotating only the token", func(t *testing.T) {
+		body := fmt.Sprintf(`{"chatwoot_url":%q,"account_id":3,"inbox_id":5,"api_token":"token-b"}`, storedURL)
+		if status, raw := env.request(http.MethodPut, path, body); status != fiber.StatusOK {
+			t.Fatalf("status = %d body = %s, want 200", status, raw)
+		}
+		assertReplyEnvConfig(t, env, storedURL, "token-b")
+		if reply := env.link("WA-REPLY"); reply == nil || reply.ChatwootConfigID != 11 {
+			t.Fatalf("reply link after rotation = %+v, want config 11", reply)
+		}
+		if n := env.countByConfig(11); n != 1 {
+			t.Fatalf("Count(11) after rotation = %d, want 1", n)
+		}
+	})
+}
+
+// DELETE of config 11 removes the links it owns, the forwarded link and the
+// webhook-written reply link, and keeps the legacy link (config 0) and a control
+// link of config 22. The conversation lookup filtered by 11 then finds nothing,
+// and the by-config delete refuses config 0 without touching the legacy link.
+func TestChatwootConfigDeleteRemovesForwarderAndReplyLinks(t *testing.T) {
+	env := newReplyEnv(t, true)
+	const controlDevice = "device-b@s.whatsapp.net"
+	env.insertDeviceConfig(22, "slot-b", controlDevice, 3, 6, true)
+	env.seedLink(legacyConversationLink())
+	env.seedLink(forwardedConversationLink())
+	env.seedLink(domainChatStorage.ChatwootMessageLink{DeviceID: controlDevice, WhatsAppMessageID: "WA-CTRL",
+		WhatsAppChatJID: "peer-b@s.whatsapp.net", ChatwootMessageID: 43, ChatwootConversationID: 8, ChatwootInboxID: 6, ChatwootConfigID: 22})
+	// The legacy link is the latest of the conversation, so the route reaches
+	// delivery with config 0: the reply link only gets config 11 if the scope
+	// is completed there.
+	env.setLinkTimes("WA-FWD", linkFixtureAt(0), linkFixtureAt(0))
+	env.setLinkTimes("WA-OLD", linkFixtureAt(1), linkFixtureAt(1))
+	if reply := env.createReply("/chatwoot/webhook"); reply.ChatwootConfigID != 11 {
+		t.Fatalf("reply link = %+v, want config 11", reply)
+	}
+	if n := env.countByConfig(11); n != 2 {
+		t.Fatalf("Count(11) before delete = %d, want 2 (forwarded and reply links)", n)
+	}
+
+	if status, raw := env.request(http.MethodDelete, "/devices/"+replyTestSlot+"/chatwoot/config", ""); status != fiber.StatusOK {
+		t.Fatalf("delete status = %d body = %s, want 200", status, raw)
+	}
+	if cfg, err := env.base.GetChatwootDeviceConfig(replyTestSlot); err != nil || cfg != nil {
+		t.Fatalf("config after delete = %+v, err = %v; want none", cfg, err)
+	}
+	if cfg, err := env.base.GetChatwootDeviceConfig("slot-b"); err != nil || cfg == nil || cfg.ID != 22 {
+		t.Fatalf("control config = %+v, err = %v; want config 22", cfg, err)
+	}
+	for _, waID := range []string{"WA-FWD", "WA-REPLY"} {
+		if link := env.link(waID); link != nil {
+			t.Fatalf("link %s survived the config delete: %+v", waID, link)
+		}
+	}
+	if n := env.countByConfig(11); n != 0 {
+		t.Fatalf("Count(11) after delete = %d, want 0", n)
+	}
+	if old := env.link("WA-OLD"); old == nil || old.ChatwootConfigID != 0 {
+		t.Fatalf("old link = %+v, want kept with config 0", old)
+	}
+	control, err := env.base.GetChatwootMessageLinkByWhatsAppID(controlDevice, "WA-CTRL")
+	if err != nil || control == nil || control.ChatwootConfigID != 22 {
+		t.Fatalf("control link = %+v, err = %v; want kept with config 22", control, err)
+	}
+	if link, err := env.base.GetLatestChatwootMessageLinkByConversation(7, 3, false, 11); err != nil || link != nil {
+		t.Fatalf("conversation lookup in config 11 = %+v, err = %v; want nil", link, err)
+	}
+
+	if err := env.base.DeleteChatwootMessageLinksByConfig(0); err == nil {
+		t.Fatal("DeleteChatwootMessageLinksByConfig(0) = nil, want an error")
+	}
+	if old := env.link("WA-OLD"); old == nil || old.ChatwootConfigID != 0 {
+		t.Fatalf("old link after config-0 delete = %+v, want kept", old)
+	}
 }

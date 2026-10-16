@@ -537,6 +537,17 @@ With `CHATWOOT_MESSAGE_READ=true`, WhatsApp read receipts update Chatwoot `last_
 
 Inbound replies and reactions are threaded onto the message they reference (again via the `WAID:` source-id), so a reply or 👍 lands attached to the right message in the Chatwoot conversation.
 
+### Quoted agent replies
+
+When an agent replies to a specific message in Chatwoot, the WhatsApp message quotes the original:
+
+- A reference whose `in_reply_to_external_id` is `WAID:<id>` (a mirrored WhatsApp message) quotes that WhatsApp message, but only when the message is in the sending device's local message store and belongs to the reply's destination chat (with the same `@lid` rule as below). When it is not, the reply is sent without a quote; the numeric `in_reply_to` is not tried instead.
+- Otherwise the numeric `in_reply_to` is resolved through the local durable message link written when that Chatwoot message was delivered or mirrored. This covers replies to earlier agent messages, which have no `source_id`. The lookup is scoped to the sending device, conversation, account, inbox, and config; the link's chat must also match the reply's destination (an `@lid` chat counts as equal to its phone JID only when the sending device knows the mapping).
+- Text and every attachment carry the quote, including the audio-to-file fallback. The caption still goes on the first attachment only. A reply to a message that had several attachments quotes its first delivered file.
+- A reference that cannot be resolved is not an error: the reply is sent as an ordinary message and no failure note is added. This includes a missing link, a link from another scope or chat, a `WAID:` message from another chat, and an original that is not in the local message store (for example, one older than the local history).
+
+Replies delivered on per-device routes are linked to the device's confirmed config, even when the route itself came from a contact `gowa_device_id` override or from an older config-0 link. Those links count as linked conversations for the routing-identity edit guard and are deleted with the config. Existing config-0 links are not migrated. When the config cannot be confirmed (for example, it is disabled or bound to another account/inbox), the reply is still sent, but without a numeric quote lookup and without writing a new link.
+
 ### Ignoring chats
 
 `CHATWOOT_IGNORE_JIDS` lets you exclude chats from Chatwoot entirely, on top of the always-ignored system JIDs (`status@broadcast`, `0@s.whatsapp.net`). It accepts a comma-separated list of exact JIDs or the wildcards `@g.us` (all groups), `@s.whatsapp.net` (all DMs), or `@lid`:
@@ -574,6 +585,7 @@ Live WhatsApp messages that hit a transient Chatwoot failure (network error, HTT
 | Audio | ✅ | Sent as voice note (PTT) |
 | Video | ✅ | - |
 | Files | ✅ | Any file type supported |
+| Quoted replies | ✅ | Quotes the original WhatsApp message when it can be resolved; see [Quoted agent replies](#quoted-agent-replies) |
 
 ### Group Support
 

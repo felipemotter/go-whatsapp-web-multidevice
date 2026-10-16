@@ -50,6 +50,12 @@ type IChatStorageRepository interface {
 	UpsertChatwootMessageLink(link *ChatwootMessageLink) error
 	GetChatwootMessageLinkByWhatsAppID(deviceID, waMessageID string) (*ChatwootMessageLink, error)
 	GetChatwootMessageLinkByChatwootID(deviceID string, chatwootMessageID int) (*ChatwootMessageLink, error)
+	// GetChatwootMessageLinkForReply resolves the link of a quoted Chatwoot
+	// message within the device, conversation, account, inbox, and config scope,
+	// applying the scope before choosing one row: exact account first, then the
+	// oldest link (created_at, then wa_message_id). Returns (nil, nil) when no
+	// link matches.
+	GetChatwootMessageLinkForReply(filter ChatwootReplyLinkFilter) (*ChatwootMessageLink, error)
 	// GetLatestChatwootMessageLinkByConversation resolves a conversation to its
 	// most recent link. Conversation ids are numbered per Chatwoot account, so the
 	// lookup is account-scoped. allowLegacyZero additionally matches rows whose

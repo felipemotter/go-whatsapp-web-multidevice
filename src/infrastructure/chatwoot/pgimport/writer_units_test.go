@@ -308,6 +308,11 @@ func TestInsertMessage_ReturnsChatwootLinkForInsertedMessage(t *testing.T) {
 	if link.ChatwootMessageID != 303 || link.ChatwootConversationID != 10 || link.SourceID != "WAID:wa-linked" {
 		t.Fatalf("unexpected link: %+v", link)
 	}
+	// Legacy-only importer: config stays 0, account and inbox come from the importer.
+	if link.ChatwootConfigID != 0 || link.ChatwootAccountID != imp.accountID || link.ChatwootInboxID != imp.inboxID {
+		t.Fatalf("link scope config=%d account=%d inbox=%d, want 0/%d/%d",
+			link.ChatwootConfigID, link.ChatwootAccountID, link.ChatwootInboxID, imp.accountID, imp.inboxID)
+	}
 	_ = tx.Rollback()
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

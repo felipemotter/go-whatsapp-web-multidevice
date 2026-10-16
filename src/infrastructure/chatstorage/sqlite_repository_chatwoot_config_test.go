@@ -1,7 +1,9 @@
 package chatstorage
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 )
@@ -314,4 +316,175 @@ func TestSQLiteRepositoryDeleteChatwootMessageLinksByConfig(t *testing.T) {
 	if got, _ := repo.GetChatwootMessageLinkByWhatsAppID("dev-l", "l1"); got == nil {
 		t.Fatal("legacy link must survive")
 	}
+}
+
+// chatwoot_config_id defaults to 0 for a writer that omits it, round-trips
+// 0 and a positive id through every getter that loads it, and the upsert UPDATE
+// rewrites it in place. Rewriting is explicit: there is no automatic migration.
+func TestSQLiteRepositoryChatwootMessageLinkConfigRoundTrip(t *testing.T) {
+	base := time.Date(2026, time.October, 1, 9, 0, 0, 0, time.UTC)
+	const deviceID = "device-a@s.whatsapp.net"
+
+	t.Run("insert omitting the column defaults to 0", func(t *testing.T) {
+		repo := newTestSQLiteRepository(t)
+		if _, err := repo.db.Exec(`
+			INSERT INTO chatwoot_message_links (
+				device_id, wa_message_id, wa_chat_jid, chatwoot_message_id,
+				chatwoot_conversation_id, chatwoot_inbox_id, direction,
+				chatwoot_account_id, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, deviceID, "WA-NO-CONFIG", "peer-a@s.whatsapp.net", 41, 7, 5, "incoming", 3, base, base); err != nil {
+			t.Fatalf("insert without config column: %v", err)
+		}
+		got, err := repo.GetChatwootMessageLinkByWhatsAppID(deviceID, "WA-NO-CONFIG")
+		if err != nil || got == nil {
+			t.Fatalf("load link: %+v, %v", got, err)
+		}
+		if got.ChatwootConfigID != 0 {
+			t.Fatalf("config id = %d, want 0", got.ChatwootConfigID)
+		}
+	})
+
+	for _, k := range []int64{0, 11} {
+		t.Run(fmt.Sprintf("config %d through every getter", k), func(t *testing.T) {
+			repo := newTestSQLiteRepository(t)
+			link := replyLinkFixture("WA-K", base)
+			link.ChatwootConfigID = k
+			link.Direction = "incoming"
+			upsertReplyLinks(t, repo, link)
+
+			filter := replyLinkFilter()
+			filter.ChatwootConfigID = k
+			getters := []struct {
+				name string
+				get  func() (*domainChatStorage.ChatwootMessageLink, error)
+			}{
+				{"by whatsapp id", func() (*domainChatStorage.ChatwootMessageLink, error) {
+					return repo.GetChatwootMessageLinkByWhatsAppID(deviceID, "WA-K")
+				}},
+				{"by chatwoot id", func() (*domainChatStorage.ChatwootMessageLink, error) {
+					return repo.GetChatwootMessageLinkByChatwootID(deviceID, 41)
+				}},
+				{"latest by conversation", func() (*domainChatStorage.ChatwootMessageLink, error) {
+					return repo.GetLatestChatwootMessageLinkByConversation(7, 3, false, k)
+				}},
+				{"latest unread by chat", func() (*domainChatStorage.ChatwootMessageLink, error) {
+					return repo.GetLatestUnreadChatwootMessageLinkByChat(deviceID, "peer-a@s.whatsapp.net")
+				}},
+				{"for reply", func() (*domainChatStorage.ChatwootMessageLink, error) {
+					return repo.GetChatwootMessageLinkForReply(filter)
+				}},
+			}
+			for _, g := range getters {
+				got, err := g.get()
+				if err != nil || got == nil {
+					t.Fatalf("%s: %+v, %v", g.name, got, err)
+				}
+				if got.WhatsAppMessageID != "WA-K" || got.ChatwootConfigID != k {
+					t.Fatalf("%s: link %s config = %d, want WA-K config %d", g.name, got.WhatsAppMessageID, got.ChatwootConfigID, k)
+				}
+			}
+		})
+	}
+
+	t.Run("update rewrites 0 to 11 in place", func(t *testing.T) {
+		repo := newTestSQLiteRepository(t)
+		stored := replyLinkFixture("WA-K", base)
+		stored.ChatwootConfigID = 0
+		upsertReplyLinks(t, repo, stored)
+
+		// A fresh writer object (zero CreatedAt) for the same key.
+		update := replyLinkFixture("WA-K", time.Time{})
+		update.ChatwootConfigID = 11
+		upsertReplyLinks(t, repo, update)
+
+		var rows int
+		if err := repo.db.QueryRow(`SELECT COUNT(*) FROM chatwoot_message_links WHERE device_id = ? AND wa_message_id = ?`,
+			deviceID, "WA-K").Scan(&rows); err != nil {
+			t.Fatalf("count rows: %v", err)
+		}
+		if rows != 1 {
+			t.Fatalf("rows for key = %d, want 1", rows)
+		}
+		got, err := repo.GetChatwootMessageLinkByWhatsAppID(deviceID, "WA-K")
+		if err != nil || got == nil {
+			t.Fatalf("load link: %+v, %v", got, err)
+		}
+		if got.ChatwootConfigID != 11 {
+			t.Fatalf("config id = %d, want 11", got.ChatwootConfigID)
+		}
+		if !got.CreatedAt.Equal(base) {
+			t.Fatalf("created_at = %v, want preserved %v", got.CreatedAt, base)
+		}
+	})
+}
+
+// Deleting config 11 removes the forwarded and reply links but not the legacy
+// link (config 0) nor the config 22 control; deleting config 0 is refused
+// outright.
+func TestSQLiteRepositoryDeleteChatwootMessageLinksByConfigKeepsLegacyAndOtherConfigs(t *testing.T) {
+	repo := newTestSQLiteRepository(t)
+	const deviceID = "device-a@s.whatsapp.net"
+	control := replyLinkFixture("WA-CTRL-22", time.Date(2026, time.October, 1, 9, 3, 0, 0, time.UTC))
+	control.ChatwootMessageID = 43
+	control.ChatwootConfigID = 22
+	upsertReplyLinks(t, repo, append(coexistingLinks(), control)...)
+
+	counts := func(t *testing.T, want map[int64]int) {
+		t.Helper()
+		for configID, n := range want {
+			got, err := repo.CountChatwootMessageLinksByConfig(configID)
+			if err != nil || got != n {
+				t.Fatalf("Count(%d) = %d, %v; want %d", configID, got, err, n)
+			}
+		}
+	}
+	present := func(t *testing.T, want map[string]int64) {
+		t.Helper()
+		for _, id := range []string{"WA-OLD", "WA-FWD", "WA-REPLY", "WA-CTRL-22"} {
+			got, err := repo.GetChatwootMessageLinkByWhatsAppID(deviceID, id)
+			if err != nil {
+				t.Fatalf("load %s: %v", id, err)
+			}
+			configID, keep := want[id]
+			if !keep {
+				if got != nil {
+					t.Fatalf("%s = %+v, want deleted", id, got)
+				}
+				continue
+			}
+			if got == nil || got.ChatwootConfigID != configID {
+				t.Fatalf("%s = %+v, want present with config %d", id, got, configID)
+			}
+		}
+	}
+	all := map[string]int64{"WA-OLD": 0, "WA-FWD": 11, "WA-REPLY": 11, "WA-CTRL-22": 22}
+
+	counts(t, map[int64]int{0: 1, 11: 2, 22: 1})
+
+	if err := repo.DeleteChatwootMessageLinksByConfig(0); err == nil {
+		t.Fatal("Delete(0) must return an error")
+	}
+	counts(t, map[int64]int{0: 1, 11: 2, 22: 1})
+	present(t, all)
+
+	if err := repo.DeleteChatwootMessageLinksByConfig(11); err != nil {
+		t.Fatalf("Delete(11): %v", err)
+	}
+	counts(t, map[int64]int{0: 1, 11: 0, 22: 1})
+	present(t, map[string]int64{"WA-OLD": 0, "WA-CTRL-22": 22})
+
+	if got, err := repo.GetLatestChatwootMessageLinkByConversation(7, 3, false, 11); err != nil || got != nil {
+		t.Fatalf("conversation lookup with config 11 = %+v, %v; want nil", got, err)
+	}
+	filter := replyLinkFilter()
+	filter.ChatwootMessageID = 42
+	if got, err := repo.GetChatwootMessageLinkForReply(filter); err != nil || got != nil {
+		t.Fatalf("reply lookup for the reply link after Delete(11) = %+v, %v; want nil", got, err)
+	}
+
+	if err := repo.DeleteChatwootMessageLinksByConfig(0); err == nil {
+		t.Fatal("Delete(0) must still return an error")
+	}
+	present(t, map[string]int64{"WA-OLD": 0, "WA-CTRL-22": 22})
 }

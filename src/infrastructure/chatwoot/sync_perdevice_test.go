@@ -91,19 +91,55 @@ func TestSyncServiceRebuiltOnClientChange(t *testing.T) {
 	}
 }
 
+// With the global DSN configured, only the legacy service
+// reaches the direct-Postgres importer. The per-device service, built as REST
+// and auto-sync build it, returns (nil, nil) and keeps using REST. The legacy
+// contrast proves the DSN is live for the test: it is dialed and refused.
 func TestPgImporterGatedByAllowPgImport(t *testing.T) {
-	prev := config.ChatwootImportDBURI
-	config.ChatwootImportDBURI = "postgresql://user:pass@localhost:5432/chatwoot"
-	t.Cleanup(func() { config.ChatwootImportDBURI = prev })
+	prevURI := config.ChatwootImportDBURI
+	prevAccount := config.ChatwootAccountID
+	prevInbox := config.ChatwootInboxID
+	t.Cleanup(func() {
+		config.ChatwootImportDBURI = prevURI
+		config.ChatwootAccountID = prevAccount
+		config.ChatwootInboxID = prevInbox
+		_ = CloseAllSyncServices()
+	})
+	// Port 1 on loopback refuses immediately, so opening the importer fails fast.
+	config.ChatwootImportDBURI = "postgres://chatwoot:secret@127.0.0.1:1/chatwoot?sslmode=disable&connect_timeout=1"
+	config.ChatwootAccountID = 3
+	config.ChatwootInboxID = 5
 
-	// Direct-DB import configured, but a per-device service must not use it.
-	s := &SyncService{allowPgImport: false}
-	imp, err := s.pgImporterForSync(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name     string
+		key      string
+		configID int64
+		wantErr  bool
+	}{
+		{name: "per-device config 11", key: "device-a@s.whatsapp.net", configID: 11, wantErr: false},
+		{name: "legacy config 0", key: legacySyncServiceKey, configID: 0, wantErr: true},
 	}
-	if imp != nil {
-		t.Fatal("per-device service must return nil importer (REST-only) even when ChatwootImportDBURI is set")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClientFromConfig("https://chatwoot.example.com", "t", 3, 5)
+			s := GetSyncServiceForDevice(tc.key, client, nil, tc.configID == 0, tc.configID)
+			imp, err := s.pgImporterForSync(context.Background())
+			if imp != nil {
+				t.Fatalf("importer = %v, want nil", imp)
+			}
+			if s.pgImporter != nil {
+				t.Fatalf("cached importer = %v, want nil", s.pgImporter)
+			}
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("legacy service error = nil, want the configured DSN to be dialed and fail")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("per-device service error = %v, want nil (REST-only even with ChatwootImportDBURI set)", err)
+			}
+		})
 	}
 }
 

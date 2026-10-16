@@ -1091,6 +1091,49 @@ func (r *SQLiteRepository) GetChatwootMessageLinkByChatwootID(deviceID string, c
 	return link, err
 }
 
+// GetChatwootMessageLinkForReply resolves the link behind a quoted Chatwoot
+// message. Unlike GetChatwootMessageLinkByChatwootID, the whole scope is applied
+// before LIMIT 1, so a legacy or foreign row with the same ids cannot be picked
+// ahead of the current one. Config id 0 is an equality predicate here (it never
+// disables the config filter), and account id 0 rows qualify only in confirmed
+// legacy mode (config 0 plus AllowLegacyAccountZero). Among eligible rows the
+// exact account wins, then the oldest created_at, then the lowest wa_message_id,
+// so a reply to a multi-attachment message always resolves the same row.
+func (r *SQLiteRepository) GetChatwootMessageLinkForReply(filter domainChatStorage.ChatwootReplyLinkFilter) (*domainChatStorage.ChatwootMessageLink, error) {
+	deviceID := strings.TrimSpace(filter.DeviceID)
+	if deviceID == "" || filter.ChatwootMessageID <= 0 || filter.ChatwootConversationID <= 0 ||
+		filter.ChatwootAccountID <= 0 || filter.ChatwootInboxID <= 0 || filter.ChatwootConfigID < 0 {
+		return nil, fmt.Errorf("chatwoot reply link lookup requires device, message, conversation, account, and inbox scope")
+	}
+
+	query := `
+		SELECT device_id, wa_message_id, wa_chat_jid, chatwoot_message_id,
+			chatwoot_conversation_id, chatwoot_inbox_id,
+			chatwoot_contact_inbox_source_id, source_id, direction,
+			is_read, created_at, updated_at, chatwoot_config_id, chatwoot_account_id
+		FROM chatwoot_message_links
+		WHERE device_id = ? AND chatwoot_message_id = ? AND chatwoot_conversation_id = ?
+			AND chatwoot_inbox_id = ? AND chatwoot_config_id = ?
+			AND (chatwoot_account_id = ? OR (? = 1 AND chatwoot_config_id = 0 AND chatwoot_account_id = 0))
+		ORDER BY CASE WHEN chatwoot_account_id = ? THEN 0 ELSE 1 END, created_at ASC, wa_message_id ASC
+		LIMIT 1
+	`
+
+	legacyZero := 0
+	if filter.AllowLegacyAccountZero && filter.ChatwootConfigID == 0 {
+		legacyZero = 1
+	}
+	link, err := r.scanChatwootMessageLink(r.db.QueryRow(query,
+		deviceID, filter.ChatwootMessageID, filter.ChatwootConversationID,
+		filter.ChatwootInboxID, filter.ChatwootConfigID,
+		filter.ChatwootAccountID, legacyZero,
+		filter.ChatwootAccountID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return link, err
+}
+
 func (r *SQLiteRepository) GetLatestChatwootMessageLinkByConversation(conversationID, accountID int, allowLegacyZero bool, configID int64) (*domainChatStorage.ChatwootMessageLink, error) {
 	// The legacy-zero wildcard is gated on allowLegacyZero (true only in legacy
 	// single-account mode). The `? = 1` guard keeps this a single query: when the

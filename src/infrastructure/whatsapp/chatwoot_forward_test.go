@@ -2,10 +2,19 @@ package whatsapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 )
 
@@ -444,6 +453,486 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := buildReactionChatwootContent(tc.payload, tc.fromName); got != tc.expected {
 				t.Fatalf("expected %q, got %q", tc.expected, got)
+			}
+		})
+	}
+}
+
+// chatwootLinkMemoryRepo is an in-memory stand-in for the link, config and
+// retry-queue parts of the chat-storage repository (the SQLite implementation
+// imports this package, so it cannot be used here). Upserts store exactly the
+// object received, so a caller that rewrites a link without preserving its
+// configuration or creation time is visible in the stored row.
+type chatwootLinkMemoryRepo struct {
+	domainChatStorage.IChatStorageRepository
+	mu                sync.Mutex
+	links             []domainChatStorage.ChatwootMessageLink
+	upserts           int
+	configs           map[string]*domainChatStorage.ChatwootDeviceConfig
+	records           []*domainChatStorage.DeviceRecord
+	configLinkDeletes []int64
+	deviceDataDeletes []string
+	due               []*domainChatStorage.ChatwootForwardEvent
+	doneIDs           []int64
+	failedIDs         []int64
+	enqueued          int
+}
+
+func newChatwootLinkMemoryRepo(seed ...domainChatStorage.ChatwootMessageLink) *chatwootLinkMemoryRepo {
+	return &chatwootLinkMemoryRepo{
+		links:   append([]domainChatStorage.ChatwootMessageLink(nil), seed...),
+		configs: map[string]*domainChatStorage.ChatwootDeviceConfig{},
+	}
+}
+
+func (r *chatwootLinkMemoryRepo) find(deviceID, waMessageID string) (int, bool) {
+	for i, link := range r.links {
+		if link.DeviceID == deviceID && link.WhatsAppMessageID == waMessageID {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// stored returns a copy of the stored link, or nil when it is absent.
+func (r *chatwootLinkMemoryRepo) stored(deviceID, waMessageID string) *domainChatStorage.ChatwootMessageLink {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i, ok := r.find(deviceID, waMessageID); ok {
+		link := r.links[i]
+		return &link
+	}
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) UpsertChatwootMessageLink(link *domainChatStorage.ChatwootMessageLink) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upserts++
+	if i, ok := r.find(link.DeviceID, link.WhatsAppMessageID); ok {
+		r.links[i] = *link
+		return nil
+	}
+	r.links = append(r.links, *link)
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) GetChatwootMessageLinkByWhatsAppID(deviceID, waMessageID string) (*domainChatStorage.ChatwootMessageLink, error) {
+	return r.stored(deviceID, waMessageID), nil
+}
+
+func (r *chatwootLinkMemoryRepo) DeleteDeviceData(deviceID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deviceDataDeletes = append(r.deviceDataDeletes, deviceID)
+	kept := r.links[:0]
+	for _, link := range r.links {
+		if link.DeviceID != deviceID {
+			kept = append(kept, link)
+		}
+	}
+	r.links = kept
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) GetChatwootDeviceConfig(deviceID string) (*domainChatStorage.ChatwootDeviceConfig, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cfg, ok := r.configs[deviceID]; ok {
+		cloned := *cfg
+		return &cloned, nil
+	}
+	return nil, nil
+}
+
+func (r *chatwootLinkMemoryRepo) DeleteChatwootDeviceConfig(deviceID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.configs, deviceID)
+	return nil
+}
+
+// DeleteChatwootMessageLinksByConfig mirrors the SQLite contract: config 0
+// (legacy links) is refused, any other id removes exactly its links.
+func (r *chatwootLinkMemoryRepo) DeleteChatwootMessageLinksByConfig(configID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.configLinkDeletes = append(r.configLinkDeletes, configID)
+	if configID == 0 {
+		return errors.New("refusing to delete legacy (config id 0) chatwoot message links")
+	}
+	kept := r.links[:0]
+	for _, link := range r.links {
+		if link.ChatwootConfigID != configID {
+			kept = append(kept, link)
+		}
+	}
+	r.links = kept
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) ListDeviceRecords() ([]*domainChatStorage.DeviceRecord, error) {
+	return r.records, nil
+}
+
+func (r *chatwootLinkMemoryRepo) DeleteDeviceRecord(string) error { return nil }
+
+func (r *chatwootLinkMemoryRepo) EnqueueChatwootForwardEvent(*domainChatStorage.ChatwootForwardEvent) error {
+	r.enqueued++
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) ListDueChatwootForwardEvents(time.Time, int) ([]*domainChatStorage.ChatwootForwardEvent, error) {
+	return r.due, nil
+}
+
+func (r *chatwootLinkMemoryRepo) MarkChatwootForwardEventDone(id int64) error {
+	r.doneIDs = append(r.doneIDs, id)
+	return nil
+}
+
+func (r *chatwootLinkMemoryRepo) MarkChatwootForwardEventFailed(id int64, _ string, _ time.Time) error {
+	r.failedIDs = append(r.failedIDs, id)
+	return nil
+}
+
+// fakeChatwootAPI answers the Chatwoot endpoints the forwarder uses for
+// account 3 / inbox 5: contact 9 has the open conversation 7, and every created
+// message gets the configured id. Each request is recorded as "METHOD path".
+type fakeChatwootAPI struct {
+	mu          sync.Mutex
+	requests    []string
+	sourceIDs   []string
+	nextMessage int
+}
+
+func newFakeChatwootAPI(t *testing.T, nextMessage int) (*fakeChatwootAPI, *chatwoot.Client) {
+	t.Helper()
+	api := &fakeChatwootAPI{nextMessage: nextMessage}
+	srv := httptest.NewServer(http.HandlerFunc(api.serve))
+	t.Cleanup(srv.Close)
+	client := &chatwoot.Client{
+		BaseURL:         srv.URL,
+		APIToken:        "token-a",
+		AccountID:       3,
+		InboxID:         5,
+		InboxIdentifier: "inbox-a",
+		HTTPClient:      srv.Client(),
+	}
+	return api, client
+}
+
+func (a *fakeChatwootAPI) serve(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.requests = append(a.requests, r.Method+" "+r.URL.Path)
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/accounts/3/contacts/search":
+		_, _ = w.Write([]byte(`{"payload":[]}`))
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/accounts/3/contacts":
+		_, _ = w.Write([]byte(`{"payload":{"contact":{"id":9}}}`))
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/accounts/3/contacts/9/conversations":
+		_, _ = w.Write([]byte(`{"payload":[{"id":7,"inbox_id":5,"status":"open"}]}`))
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/accounts/3/conversations/7/messages":
+		var body struct {
+			SourceID string `json:"source_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		a.sourceIDs = append(a.sourceIDs, body.SourceID)
+		_, _ = fmt.Fprintf(w, `{"id":%d}`, a.nextMessage)
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/accounts/3/conversations/7/messages/"):
+		_, _ = w.Write([]byte(`{}`))
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/update_last_seen"):
+		_, _ = w.Write([]byte(`{}`))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (a *fakeChatwootAPI) recorded() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.requests...)
+}
+
+func (a *fakeChatwootAPI) count(request string) int {
+	n := 0
+	for _, got := range a.recorded() {
+		if got == request {
+			n++
+		}
+	}
+	return n
+}
+
+const (
+	fwDevice = "device-a@s.whatsapp.net"
+	fwChat   = "peer-a@s.whatsapp.net"
+)
+
+var (
+	fwCreatedAt = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	fwUpdatedAt = time.Date(2026, 1, 2, 3, 9, 5, 0, time.UTC)
+)
+
+// fwLink builds a stored link of conversation 7 / inbox 5 on device-a.
+func fwLink(waMessageID string, chatwootMessageID int, configID int64, accountID int, sourceID, direction string) domainChatStorage.ChatwootMessageLink {
+	return domainChatStorage.ChatwootMessageLink{
+		DeviceID:                     fwDevice,
+		WhatsAppMessageID:            waMessageID,
+		WhatsAppChatJID:              fwChat,
+		ChatwootMessageID:            chatwootMessageID,
+		ChatwootConversationID:       7,
+		ChatwootInboxID:              5,
+		ChatwootContactInboxSourceID: fwChat,
+		SourceID:                     sourceID,
+		Direction:                    direction,
+		CreatedAt:                    fwCreatedAt,
+		UpdatedAt:                    fwUpdatedAt,
+		ChatwootConfigID:             configID,
+		ChatwootAccountID:            accountID,
+	}
+}
+
+// stubChatwootResolution points the forwarder at client under configID and
+// records the device identifiers it is resolved with.
+func stubChatwootResolution(t *testing.T, client *chatwoot.Client, configID int64) *[]string {
+	t.Helper()
+	orig := getChatwootClientFn
+	t.Cleanup(func() { getChatwootClientFn = orig })
+	var resolvedWith []string
+	getChatwootClientFn = func(deviceID string) (*chatwoot.ResolvedConfig, error) {
+		resolvedWith = append(resolvedWith, deviceID)
+		return &chatwoot.ResolvedConfig{ConfigID: configID, DeviceID: "slot-a", Client: client}, nil
+	}
+	return &resolvedWith
+}
+
+func fwMessagePayload(waMessageID string, fromMe bool) map[string]any {
+	return map[string]any{"payload": map[string]any{
+		"id":         waMessageID,
+		"chat_id":    fwChat,
+		"from":       fwChat,
+		"from_name":  "Peer A",
+		"body":       "Oi",
+		"is_from_me": fromMe,
+	}}
+}
+
+// deliverForwardEvent runs a "message" event through the live forwarder (with
+// the slot's scoped storage in the context) or through the retry worker.
+func deliverForwardEvent(t *testing.T, path string, repo *chatwootLinkMemoryRepo, payload map[string]any) {
+	t.Helper()
+	switch path {
+	case "live":
+		instance := &DeviceInstance{id: "slot-a", jid: fwDevice, chatStorageRepo: newDeviceChatStorage(fwDevice, repo)}
+		forwardToChatwoot(ContextWithDevice(context.Background(), instance), payload, "message")
+		if repo.enqueued != 0 {
+			t.Fatalf("live forward queued %d retries, want 0", repo.enqueued)
+		}
+	case "retry":
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal retry payload: %v", err)
+		}
+		repo.due = []*domainChatStorage.ChatwootForwardEvent{{ID: 1, DeviceID: fwDevice, EventName: "message", PayloadJSON: string(raw)}}
+		processDueChatwootForwardRetries(repo)
+		if !slices.Equal(repo.doneIDs, []int64{1}) || len(repo.failedIDs) != 0 {
+			t.Fatalf("retry done=%v failed=%v, want done=[1] failed=[]", repo.doneIDs, repo.failedIDs)
+		}
+	default:
+		t.Fatalf("unknown path %q", path)
+	}
+}
+
+// The forwarder (live and retry) persists the link under the
+// configuration the registry resolved for the device — 0 in legacy mode, the
+// positive id in per-device mode — together with account, inbox and the
+// WAID source id it sent to Chatwoot.
+func TestChatwootForwardStoresResolvedConfigOnLink(t *testing.T) {
+	cases := []struct {
+		path     string
+		configID int64
+	}{
+		{path: "live", configID: 0},
+		{path: "live", configID: 11},
+		{path: "retry", configID: 0},
+		{path: "retry", configID: 11},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s config %d", tc.path, tc.configID), func(t *testing.T) {
+			api, client := newFakeChatwootAPI(t, 41)
+			resolvedWith := stubChatwootResolution(t, client, tc.configID)
+			repo := newChatwootLinkMemoryRepo()
+
+			deliverForwardEvent(t, tc.path, repo, fwMessagePayload("WA-FWD", false))
+
+			if !slices.Equal(*resolvedWith, []string{fwDevice}) {
+				t.Fatalf("resolved with %q, want [%q]", *resolvedWith, fwDevice)
+			}
+			if !slices.Equal(api.sourceIDs, []string{"WAID:WA-FWD"}) {
+				t.Fatalf("created messages source ids = %q, want [WAID:WA-FWD]", api.sourceIDs)
+			}
+			if repo.upserts != 1 {
+				t.Fatalf("upserts = %d, want 1", repo.upserts)
+			}
+			link := repo.stored(fwDevice, "WA-FWD")
+			if link == nil {
+				t.Fatal("forwarded message link was not stored")
+			}
+			if link.ChatwootConfigID != tc.configID || link.ChatwootAccountID != 3 || link.ChatwootInboxID != 5 || link.SourceID != "WAID:WA-FWD" {
+				t.Fatalf("link scope = config %d account %d inbox %d source %q, want config %d account 3 inbox 5 source WAID:WA-FWD",
+					link.ChatwootConfigID, link.ChatwootAccountID, link.ChatwootInboxID, link.SourceID, tc.configID)
+			}
+			if link.ChatwootMessageID != 41 || link.ChatwootConversationID != 7 || link.WhatsAppChatJID != fwChat {
+				t.Fatalf("link ids = message %d conversation %d chat %q, want 41 / 7 / %q",
+					link.ChatwootMessageID, link.ChatwootConversationID, link.WhatsAppChatJID, fwChat)
+			}
+		})
+	}
+}
+
+// A message whose WhatsApp id already has a link is not mirrored again,
+// whatever configuration the link or the current resolution carries. The
+// legacy link is not promoted to 11 and the echo of the delivered reply does
+// not overwrite the reply link.
+func TestChatwootForwardSkipsAlreadyLinkedMessage(t *testing.T) {
+	legacy := fwLink("WA-OLD", 40, 0, 3, "WAID:WA-OLD", "incoming")
+	forwarded := fwLink("WA-FWD", 41, 11, 3, "WAID:WA-FWD", "incoming")
+	reply := fwLink("WA-REPLY", 42, 11, 3, "", "outgoing")
+
+	targets := []struct {
+		waMessageID string
+		fromMe      bool
+	}{
+		{waMessageID: "WA-OLD", fromMe: false},
+		{waMessageID: "WA-FWD", fromMe: false},
+		{waMessageID: "WA-REPLY", fromMe: true},
+	}
+	for _, target := range targets {
+		for _, configID := range []int64{0, 11} {
+			for _, path := range []string{"live", "retry"} {
+				t.Run(fmt.Sprintf("%s resolved %d %s", target.waMessageID, configID, path), func(t *testing.T) {
+					api, client := newFakeChatwootAPI(t, 99)
+					stubChatwootResolution(t, client, configID)
+					repo := newChatwootLinkMemoryRepo(legacy, forwarded, reply)
+
+					deliverForwardEvent(t, path, repo, fwMessagePayload(target.waMessageID, target.fromMe))
+
+					if got := api.recorded(); len(got) != 0 {
+						t.Fatalf("Chatwoot requests = %q, want none", got)
+					}
+					if repo.upserts != 0 {
+						t.Fatalf("upserts after seed = %d, want 0", repo.upserts)
+					}
+					for _, want := range []domainChatStorage.ChatwootMessageLink{legacy, forwarded, reply} {
+						got := repo.stored(fwDevice, want.WhatsAppMessageID)
+						if got == nil || *got != want {
+							t.Fatalf("link %s = %+v, want unchanged %+v", want.WhatsAppMessageID, got, want)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// On the forwarder side, a read receipt posts update_last_seen for the linked
+// conversation and rewrites the whole link with only IsRead flipped, so the
+// configuration and creation time survive for 0 and 11. A link of another
+// account is neither posted nor touched.
+func TestChatwootReadReceiptPreservesLinkConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		link      domainChatStorage.ChatwootMessageLink
+		wantPosts int
+	}{
+		{name: "legacy link with account 0", link: fwLink("WA-OLD", 40, 0, 0, "WAID:WA-OLD", "incoming"), wantPosts: 1},
+		{name: "legacy link with account 3", link: fwLink("WA-OLD", 40, 0, 3, "WAID:WA-OLD", "incoming"), wantPosts: 1},
+		{name: "config 11 link", link: fwLink("WA-REPLY", 42, 11, 3, "", "outgoing"), wantPosts: 1},
+		{name: "legacy link of another account", link: fwLink("WA-OLD", 40, 0, 4, "WAID:WA-OLD", "incoming"), wantPosts: 0},
+		{name: "config 11 link of another account", link: fwLink("WA-REPLY", 42, 11, 4, "", "outgoing"), wantPosts: 0},
+	}
+	const lastSeen = "POST /public/api/v1/inboxes/inbox-a/contacts/" + fwChat + "/conversations/7/update_last_seen"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api, client := newFakeChatwootAPI(t, 99)
+			stubChatwootResolution(t, client, 11)
+			repo := newChatwootLinkMemoryRepo(tc.link)
+			payload := map[string]any{"payload": map[string]any{
+				"receipt_type": "read",
+				"ids":          []any{tc.link.WhatsAppMessageID},
+			}}
+
+			if err := syncPayloadToChatwoot(context.Background(), payload, "message.ack", fwDevice, repo); err != nil {
+				t.Fatalf("syncPayloadToChatwoot: %v", err)
+			}
+
+			want := tc.link
+			if tc.wantPosts == 1 {
+				want.IsRead = true
+				if got := api.recorded(); !slices.Equal(got, []string{lastSeen}) {
+					t.Fatalf("Chatwoot requests = %q, want [%q]", got, lastSeen)
+				}
+			} else if got := api.recorded(); len(got) != 0 {
+				t.Fatalf("Chatwoot requests = %q, want none", got)
+			}
+			if repo.upserts != tc.wantPosts {
+				t.Fatalf("upserts = %d, want %d", repo.upserts, tc.wantPosts)
+			}
+			got := repo.stored(fwDevice, tc.link.WhatsAppMessageID)
+			if got == nil || *got != want {
+				t.Fatalf("stored link = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// On the forwarder side, revoking a linked message deletes its Chatwoot
+// message for links of configuration 0 and 11 alike; the only gate is
+// chatwootLinkMatchesClient, which compares accounts and ignores config.
+func TestDeleteLinkedChatwootMessageIgnoresLinkConfig(t *testing.T) {
+	origDelete := config.ChatwootMessageDelete
+	t.Cleanup(func() { config.ChatwootMessageDelete = origDelete })
+	config.ChatwootMessageDelete = true
+
+	cases := []struct {
+		name      string
+		configID  int64
+		accountID int
+		wantMatch bool
+	}{
+		{name: "config 0 legacy account", configID: 0, accountID: 0, wantMatch: true},
+		{name: "config 0 same account", configID: 0, accountID: 3, wantMatch: true},
+		{name: "config 11 same account", configID: 11, accountID: 3, wantMatch: true},
+		{name: "config 0 other account", configID: 0, accountID: 4, wantMatch: false},
+		{name: "config 11 other account", configID: 11, accountID: 4, wantMatch: false},
+	}
+	const deleteRequest = "DELETE /api/v1/accounts/3/conversations/7/messages/42"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api, client := newFakeChatwootAPI(t, 99)
+			link := fwLink("WA-REPLY", 42, tc.configID, tc.accountID, "", "outgoing")
+			repo := newChatwootLinkMemoryRepo(link)
+
+			if got := chatwootLinkMatchesClient(&link, client); got != tc.wantMatch {
+				t.Fatalf("chatwootLinkMatchesClient = %t, want %t", got, tc.wantMatch)
+			}
+			deleted := deleteLinkedChatwootMessage(client, fwDevice, repo, "message.revoked", map[string]any{"revoked_message_id": "WA-REPLY"})
+
+			if deleted != tc.wantMatch {
+				t.Fatalf("deleteLinkedChatwootMessage = %t, want %t", deleted, tc.wantMatch)
+			}
+			wantDeletes := 0
+			if tc.wantMatch {
+				wantDeletes = 1
+			}
+			if got := api.count(deleteRequest); got != wantDeletes || len(api.recorded()) != wantDeletes {
+				t.Fatalf("Chatwoot requests = %q, want %d x %q", api.recorded(), wantDeletes, deleteRequest)
+			}
+			if got := repo.stored(fwDevice, "WA-REPLY"); got == nil || *got != link || repo.upserts != 0 {
+				t.Fatalf("stored link = %+v (upserts %d), want unchanged %+v", got, repo.upserts, link)
 			}
 		})
 	}

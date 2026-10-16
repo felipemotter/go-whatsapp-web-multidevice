@@ -2,6 +2,7 @@ package chatwoot
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,7 +15,8 @@ import (
 
 type chatwootSyncLinkRepo struct {
 	domainChatStorage.IChatStorageRepository
-	links map[string]*domainChatStorage.ChatwootMessageLink
+	links   map[string]*domainChatStorage.ChatwootMessageLink
+	upserts int
 }
 
 func newChatwootSyncLinkTestRepo() *chatwootSyncLinkRepo {
@@ -26,6 +28,7 @@ func chatwootSyncLinkKey(deviceID, waMessageID string) string {
 }
 
 func (r *chatwootSyncLinkRepo) UpsertChatwootMessageLink(link *domainChatStorage.ChatwootMessageLink) error {
+	r.upserts++
 	cloned := *link
 	r.links[chatwootSyncLinkKey(link.DeviceID, link.WhatsAppMessageID)] = &cloned
 	return nil
@@ -40,89 +43,205 @@ func (r *chatwootSyncLinkRepo) GetChatwootMessageLinkByWhatsAppID(deviceID, waMe
 	return &cloned, nil
 }
 
-func TestSyncMessageSkipsExistingChatwootLink(t *testing.T) {
-	repo := newChatwootSyncLinkTestRepo()
-	msg := &domainChatStorage.Message{
-		ID:        "wa-existing",
-		DeviceID:  "device-a@s.whatsapp.net",
-		ChatJID:   "628123456789@s.whatsapp.net",
-		Content:   "already synced",
-		Timestamp: time.Date(2026, time.June, 6, 10, 0, 0, 0, time.UTC),
-	}
-	if err := repo.UpsertChatwootMessageLink(&domainChatStorage.ChatwootMessageLink{
-		DeviceID:          msg.DeviceID,
-		WhatsAppMessageID: msg.ID,
-		WhatsAppChatJID:   msg.ChatJID,
-		ChatwootMessageID: 777,
-		SourceID:          "WAID:" + msg.ID,
-		Direction:         "incoming",
-	}); err != nil {
-		t.Fatalf("seed link: %v", err)
-	}
+// Synthetic scope shared by the link-producer tests below.
+const (
+	syncTestDevice       = "device-a@s.whatsapp.net"
+	syncTestChat         = "peer-a@s.whatsapp.net"
+	syncTestAccount      = 3
+	syncTestInbox        = 5
+	syncTestConversation = 7
+	syncTestConfig       = int64(11)
+)
 
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	svc := NewSyncService(&Client{
+// newSyncTestService builds the sync service the same way REST and auto-sync
+// do (GetSyncServiceForDevice, legacy key and pg import only for config 0),
+// bound to a Chatwoot client that targets server.
+func newSyncTestService(t *testing.T, server *httptest.Server, repo domainChatStorage.IChatStorageRepository, configID int64) *SyncService {
+	t.Helper()
+	t.Cleanup(func() { _ = CloseAllSyncServices() })
+	key := legacySyncServiceKey
+	if configID != 0 {
+		key = syncTestDevice
+	}
+	client := &Client{
 		BaseURL:    server.URL,
 		APIToken:   "token",
-		AccountID:  1,
-		InboxID:    2,
+		AccountID:  syncTestAccount,
+		InboxID:    syncTestInbox,
 		HTTPClient: server.Client(),
-	}, repo)
-
-	if err := svc.syncMessage(context.Background(), 42, msg, nil, SyncOptions{}, false); err != nil {
-		t.Fatalf("syncMessage: %v", err)
 	}
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("Chatwoot received %d requests, want 0 for existing link", got)
+	svc := GetSyncServiceForDevice(key, client, repo, configID == 0, configID)
+	if svc.client != client {
+		t.Fatal("sync service is not bound to the test client")
+	}
+	return svc
+}
+
+// Deduplication by WhatsApp link. An existing link stops the REST sync
+// producer whatever configuration it carries; the sync never promotes a legacy
+// link to the service config nor overwrites a delivered reply's link.
+func TestSyncMessageSkipsExistingChatwootLink(t *testing.T) {
+	legacyLink := domainChatStorage.ChatwootMessageLink{
+		DeviceID:                     syncTestDevice,
+		WhatsAppMessageID:            "WA-OLD",
+		WhatsAppChatJID:              syncTestChat,
+		ChatwootMessageID:            40,
+		ChatwootConversationID:       syncTestConversation,
+		ChatwootInboxID:              syncTestInbox,
+		ChatwootContactInboxSourceID: syncTestChat,
+		SourceID:                     "WAID:WA-OLD",
+		Direction:                    "incoming",
+		ChatwootConfigID:             0,
+		ChatwootAccountID:            syncTestAccount,
+	}
+	forwardedLink := legacyLink
+	forwardedLink.WhatsAppMessageID = "WA-FWD"
+	forwardedLink.ChatwootMessageID = 41
+	forwardedLink.SourceID = "WAID:WA-FWD"
+	forwardedLink.ChatwootConfigID = syncTestConfig
+	replyLink := legacyLink
+	replyLink.WhatsAppMessageID = "WA-REPLY"
+	replyLink.ChatwootMessageID = 42
+	replyLink.SourceID = ""
+	replyLink.Direction = "outgoing"
+	replyLink.ChatwootConfigID = syncTestConfig
+
+	seeds := []struct {
+		name string
+		link domainChatStorage.ChatwootMessageLink
+	}{
+		{"legacy link config 0", legacyLink},
+		{"forwarded link config 11", forwardedLink},
+		{"reply link config 11", replyLink},
+	}
+	services := []int64{0, syncTestConfig}
+	producers := []struct {
+		name         string
+		requireMedia bool
+	}{
+		{"history sync", false},
+		{"hybrid media pre-pass", true},
+	}
+
+	for _, seed := range seeds {
+		for _, serviceConfig := range services {
+			for _, producer := range producers {
+				name := fmt.Sprintf("%s/service config %d/%s", seed.name, serviceConfig, producer.name)
+				t.Run(name, func(t *testing.T) {
+					repo := newChatwootSyncLinkTestRepo()
+					if err := repo.UpsertChatwootMessageLink(&seed.link); err != nil {
+						t.Fatalf("seed link: %v", err)
+					}
+					repo.upserts = 0
+
+					var requests atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						requests.Add(1)
+						w.WriteHeader(http.StatusInternalServerError)
+					}))
+					defer server.Close()
+					svc := newSyncTestService(t, server, repo, serviceConfig)
+
+					msg := &domainChatStorage.Message{
+						ID:        seed.link.WhatsAppMessageID,
+						DeviceID:  syncTestDevice,
+						ChatJID:   syncTestChat,
+						Content:   "already in Chatwoot",
+						IsFromMe:  seed.link.Direction == "outgoing",
+						Timestamp: time.Date(2026, time.June, 6, 10, 0, 0, 0, time.UTC),
+					}
+					if producer.requireMedia {
+						msg.MediaType = "image"
+						msg.URL = "https://mmg.whatsapp.net/file"
+						msg.MediaKey = []byte("key")
+					}
+
+					err := svc.syncMessageWithOptions(context.Background(), syncTestConversation, msg, nil,
+						SyncOptions{IncludeMedia: producer.requireMedia}, false, producer.requireMedia)
+					if err != nil {
+						t.Fatalf("syncMessageWithOptions: %v", err)
+					}
+					if got := requests.Load(); got != 0 {
+						t.Fatalf("Chatwoot message creations = %d, want 0 for an existing link", got)
+					}
+					if repo.upserts != 0 {
+						t.Fatalf("link upserts after seed = %d, want 0", repo.upserts)
+					}
+					got, err := repo.GetChatwootMessageLinkByWhatsAppID(syncTestDevice, seed.link.WhatsAppMessageID)
+					if err != nil || got == nil {
+						t.Fatalf("stored link = %+v, err = %v; want the seeded link", got, err)
+					}
+					if *got != seed.link {
+						t.Fatalf("stored link = %+v, want unchanged %+v", *got, seed.link)
+					}
+				})
+			}
+		}
 	}
 }
 
+// The REST history sync stamps the service's config on the links it
+// creates, together with the client's account and inbox.
 func TestSyncMessageStoresChatwootLinkAfterCreate(t *testing.T) {
-	repo := newChatwootSyncLinkTestRepo()
-	msg := &domainChatStorage.Message{
-		ID:        "wa-new",
-		DeviceID:  "device-a@s.whatsapp.net",
-		ChatJID:   "628123456789@s.whatsapp.net",
-		Content:   "new sync",
-		Timestamp: time.Date(2026, time.June, 6, 10, 0, 0, 0, time.UTC),
-	}
+	for _, configID := range []int64{0, syncTestConfig} {
+		t.Run(fmt.Sprintf("service config %d", configID), func(t *testing.T) {
+			repo := newChatwootSyncLinkTestRepo()
+			msg := &domainChatStorage.Message{
+				ID:        "WA-SYNC",
+				DeviceID:  syncTestDevice,
+				ChatJID:   syncTestChat,
+				Content:   "new sync",
+				Timestamp: time.Date(2026, time.June, 6, 10, 0, 0, 0, time.UTC),
+			}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/accounts/1/conversations/42/messages" {
-			t.Fatalf("path = %s", r.URL.Path)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":888}`))
-	}))
-	defer server.Close()
+			var creates, unexpected atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/v1/accounts/3/conversations/7/messages" {
+					unexpected.Add(1)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				creates.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":888}`))
+			}))
+			defer server.Close()
+			svc := newSyncTestService(t, server, repo, configID)
 
-	svc := NewSyncService(&Client{
-		BaseURL:    server.URL,
-		APIToken:   "token",
-		AccountID:  1,
-		InboxID:    2,
-		HTTPClient: server.Client(),
-	}, repo)
+			if err := svc.syncMessage(context.Background(), syncTestConversation, msg, nil, SyncOptions{}, false); err != nil {
+				t.Fatalf("syncMessage: %v", err)
+			}
+			if got := creates.Load(); got != 1 {
+				t.Fatalf("Chatwoot message creations = %d, want 1", got)
+			}
+			if got := unexpected.Load(); got != 0 {
+				t.Fatalf("unexpected Chatwoot requests = %d, want 0", got)
+			}
+			if repo.upserts != 1 || len(repo.links) != 1 {
+				t.Fatalf("link upserts = %d, stored links = %d; want 1 and 1", repo.upserts, len(repo.links))
+			}
 
-	if err := svc.syncMessage(context.Background(), 42, msg, nil, SyncOptions{}, false); err != nil {
-		t.Fatalf("syncMessage: %v", err)
-	}
-
-	link, err := repo.GetChatwootMessageLinkByWhatsAppID(msg.DeviceID, msg.ID)
-	if err != nil {
-		t.Fatalf("lookup link: %v", err)
-	}
-	if link == nil {
-		t.Fatal("expected stored chatwoot message link")
-	}
-	if link.ChatwootMessageID != 888 || link.ChatwootConversationID != 42 || link.SourceID != "WAID:wa-new" {
-		t.Fatalf("unexpected link: %+v", link)
+			link, err := repo.GetChatwootMessageLinkByWhatsAppID(syncTestDevice, "WA-SYNC")
+			if err != nil || link == nil {
+				t.Fatalf("stored link = %+v, err = %v; want a link", link, err)
+			}
+			want := domainChatStorage.ChatwootMessageLink{
+				DeviceID:                     syncTestDevice,
+				WhatsAppMessageID:            "WA-SYNC",
+				WhatsAppChatJID:              syncTestChat,
+				ChatwootMessageID:            888,
+				ChatwootConversationID:       syncTestConversation,
+				ChatwootInboxID:              syncTestInbox,
+				ChatwootContactInboxSourceID: syncTestChat,
+				SourceID:                     "WAID:WA-SYNC",
+				Direction:                    "incoming",
+				ChatwootConfigID:             configID,
+				ChatwootAccountID:            syncTestAccount,
+			}
+			if *link != want {
+				t.Fatalf("stored link = %+v, want %+v", *link, want)
+			}
+		})
 	}
 }
 
@@ -163,34 +282,50 @@ func TestSyncMessageWithRequiredMediaDoesNotCreatePlaceholderWhenDownloadFails(t
 	}
 }
 
+// Links returned by the legacy direct-Postgres importer
+// carry config 0 and the importer's account; the legacy service persists them
+// exactly as returned, without stamping its own config.
 func TestStoreChatwootImportLinksPersistsReturnedLinks(t *testing.T) {
 	repo := newChatwootSyncLinkTestRepo()
-	svc := NewSyncService(nil, repo)
-
-	result := &pgimport.ImportResult{
-		Links: []domainChatStorage.ChatwootMessageLink{
-			{
-				DeviceID:               "device-a@s.whatsapp.net",
-				WhatsAppMessageID:      "wa-imported",
-				WhatsAppChatJID:        "628123456789@s.whatsapp.net",
-				ChatwootMessageID:      909,
-				ChatwootConversationID: 808,
-				ChatwootInboxID:        707,
-				SourceID:               "WAID:wa-imported",
-				Direction:              "incoming",
-			},
-		},
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected Chatwoot request %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	svc := newSyncTestService(t, server, repo, 0)
+	if !svc.allowPgImport || svc.configID != 0 {
+		t.Fatalf("legacy service allowPgImport=%v configID=%d, want true/0", svc.allowPgImport, svc.configID)
 	}
+
+	imported := domainChatStorage.ChatwootMessageLink{
+		DeviceID:                     syncTestDevice,
+		WhatsAppMessageID:            "WA-IMPORTED",
+		WhatsAppChatJID:              syncTestChat,
+		ChatwootMessageID:            909,
+		ChatwootConversationID:       syncTestConversation,
+		ChatwootInboxID:              syncTestInbox,
+		ChatwootContactInboxSourceID: syncTestChat,
+		SourceID:                     "WAID:WA-IMPORTED",
+		Direction:                    "incoming",
+		ChatwootAccountID:            syncTestAccount,
+	}
+	result := &pgimport.ImportResult{Links: []domainChatStorage.ChatwootMessageLink{imported}}
 
 	if err := svc.storeChatwootImportLinks(result); err != nil {
 		t.Fatalf("storeChatwootImportLinks: %v", err)
 	}
-
-	link, err := repo.GetChatwootMessageLinkByWhatsAppID("device-a@s.whatsapp.net", "wa-imported")
-	if err != nil {
-		t.Fatalf("lookup link: %v", err)
+	if repo.upserts != 1 {
+		t.Fatalf("link upserts = %d, want 1", repo.upserts)
 	}
-	if link == nil || link.ChatwootMessageID != 909 {
-		t.Fatalf("expected imported link to be stored, got %+v", link)
+
+	link, err := repo.GetChatwootMessageLinkByWhatsAppID(syncTestDevice, "WA-IMPORTED")
+	if err != nil || link == nil {
+		t.Fatalf("stored link = %+v, err = %v; want the imported link", link, err)
+	}
+	if link.ChatwootConfigID != 0 || link.ChatwootAccountID != syncTestAccount {
+		t.Fatalf("stored link config=%d account=%d, want 0/%d", link.ChatwootConfigID, link.ChatwootAccountID, syncTestAccount)
+	}
+	if *link != imported {
+		t.Fatalf("stored link = %+v, want the importer result unchanged %+v", *link, imported)
 	}
 }

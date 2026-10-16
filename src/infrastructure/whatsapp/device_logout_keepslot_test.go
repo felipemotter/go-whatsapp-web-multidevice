@@ -535,3 +535,105 @@ func TestPurgeDevice_SurfacesSharedJIDLookupFailureAndKeepsSlot(t *testing.T) {
 		t.Fatal("expected slot to remain registered so the purge can be retried")
 	}
 }
+
+// Purging a slot drops its Chatwoot config and, through the config cleanup,
+// every link written under it (a delivered reply link included),
+// independently of the partition cleanup. Links of another device or of the
+// sibling's config 22 survive. When the shared JID partition is kept by the
+// existing sibling guard, the config cleanup still removes the config-11 link
+// while the partition's legacy config-0 link stays.
+func TestPurgeDevice_RemovesChatwootConfigLinks(t *testing.T) {
+	const (
+		slotA   = "slot-a"
+		slotB   = "slot-b"
+		deviceA = "device-a@s.whatsapp.net"
+		deviceB = "device-b@s.whatsapp.net"
+	)
+	link := func(device, waMessageID string, chatwootMessageID int, configID int64) domainChatStorage.ChatwootMessageLink {
+		return domainChatStorage.ChatwootMessageLink{
+			DeviceID:               device,
+			WhatsAppMessageID:      waMessageID,
+			WhatsAppChatJID:        "peer-a@s.whatsapp.net",
+			ChatwootMessageID:      chatwootMessageID,
+			ChatwootConversationID: 7,
+			ChatwootInboxID:        5,
+			ChatwootConfigID:       configID,
+			ChatwootAccountID:      3,
+		}
+	}
+
+	cases := []struct {
+		name        string
+		siblingJID  string // JID of slot-b; deviceA makes the partition shared
+		seed        []domainChatStorage.ChatwootMessageLink
+		wantGone    []string
+		wantKept    []string
+		wantDataDel []string
+	}{
+		{
+			name:       "sole slot",
+			siblingJID: deviceB,
+			seed: []domainChatStorage.ChatwootMessageLink{
+				link(deviceA, "WA-OLD", 40, 0),
+				link(deviceA, "WA-FWD", 41, 11),
+				link(deviceA, "WA-REPLY", 42, 11),
+				link(deviceB, "WB-CTRL", 50, 22),
+			},
+			wantGone:    []string{"WA-OLD", "WA-FWD", "WA-REPLY"},
+			wantKept:    []string{"WB-CTRL"},
+			wantDataDel: []string{slotA, deviceA},
+		},
+		{
+			name:       "shared JID partition kept by sibling guard",
+			siblingJID: deviceA,
+			seed: []domainChatStorage.ChatwootMessageLink{
+				link(deviceA, "WA-OLD", 40, 0),
+				link(deviceA, "WA-REPLY", 42, 11),
+				link(deviceA, "WB-CTRL", 50, 22),
+			},
+			wantGone:    []string{"WA-REPLY"},
+			wantKept:    []string{"WA-OLD", "WB-CTRL"},
+			wantDataDel: []string{slotA},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := newChatwootLinkMemoryRepo(tc.seed...)
+			storage.configs[slotA] = &domainChatStorage.ChatwootDeviceConfig{ID: 11, DeviceID: slotA, DeviceJID: deviceA, AccountID: 3, InboxID: 5, Enabled: true}
+			storage.configs[slotB] = &domainChatStorage.ChatwootDeviceConfig{ID: 22, DeviceID: slotB, DeviceJID: tc.siblingJID, AccountID: 3, InboxID: 6, Enabled: true}
+			storage.records = []*domainChatStorage.DeviceRecord{{DeviceID: slotA, JID: deviceA}, {DeviceID: slotB, JID: tc.siblingJID}}
+			manager := NewDeviceManager(nil, nil, storage)
+			manager.devices[slotA] = &DeviceInstance{id: slotA, jid: deviceA, createdAt: time.Now()}
+			manager.devices[slotB] = &DeviceInstance{id: slotB, jid: tc.siblingJID, createdAt: time.Now()}
+
+			if err := manager.PurgeDevice(context.Background(), slotA); err != nil {
+				t.Fatalf("PurgeDevice returned error: %v", err)
+			}
+
+			if !slices.Equal(storage.configLinkDeletes, []int64{11}) {
+				t.Fatalf("config link deletes = %v, want [11]", storage.configLinkDeletes)
+			}
+			if !slices.Equal(storage.deviceDataDeletes, tc.wantDataDel) {
+				t.Fatalf("partition deletes = %v, want %v", storage.deviceDataDeletes, tc.wantDataDel)
+			}
+			if cfg, _ := storage.GetChatwootDeviceConfig(slotA); cfg != nil {
+				t.Fatalf("config of %s still present: %+v", slotA, cfg)
+			}
+			if cfg, _ := storage.GetChatwootDeviceConfig(slotB); cfg == nil || cfg.ID != 22 {
+				t.Fatalf("sibling config = %+v, want config 22 kept", cfg)
+			}
+			for _, seeded := range tc.seed {
+				stored := storage.stored(seeded.DeviceID, seeded.WhatsAppMessageID)
+				switch {
+				case slices.Contains(tc.wantGone, seeded.WhatsAppMessageID) && stored != nil:
+					t.Fatalf("link %s (config %d) survived the purge", seeded.WhatsAppMessageID, seeded.ChatwootConfigID)
+				case slices.Contains(tc.wantKept, seeded.WhatsAppMessageID) && (stored == nil || *stored != seeded):
+					t.Fatalf("link %s = %+v, want kept unchanged %+v", seeded.WhatsAppMessageID, stored, seeded)
+				}
+			}
+			if _, ok := manager.GetDevice(slotB); !ok {
+				t.Fatal("expected sibling slot to remain registered")
+			}
+		})
+	}
+}

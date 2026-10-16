@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 	"github.com/sirupsen/logrus"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type ChatwootHandler struct {
@@ -331,6 +334,238 @@ func (h *ChatwootHandler) resolveChatwootForDevice(deviceID string) *chatwoot.Re
 	return rc
 }
 
+// chatwootCorrelationScope is the Chatwoot config/account/inbox that the links
+// of one delivery belong to. Known is false when the scope could not be
+// confirmed: the quoted-link lookup is then skipped and no new link is written.
+// Legacy marks confirmed single-account (env) mode, where ConfigID is 0.
+type chatwootCorrelationScope struct {
+	ConfigID  int64
+	AccountID int
+	InboxID   int
+	Legacy    bool
+	Known     bool
+}
+
+// confirmChatwootCorrelationScope completes the correlation scope of a routed
+// reply once the sending device is known. A positive route config is kept as
+// is. A route with config 0 (contact override, or an older zero-config link
+// that is still the latest in the conversation) is legacy only while no
+// per-device configs exist; otherwise the enabled config of the device that
+// will send must match the payload's account and inbox, and its id is used.
+// This affects only correlation metadata: the device, destination, and route
+// precedence are not changed here.
+func (h *ChatwootHandler) confirmChatwootCorrelationScope(payload chatwoot.WebhookPayload, route chatwootWebhookRoute, deviceIdentifiers ...string) chatwootCorrelationScope {
+	inboxID := route.InboxID
+	if inboxID == 0 {
+		inboxID = payload.Conversation.InboxID
+	}
+	if route.ConfigID > 0 {
+		return chatwootCorrelationScope{ConfigID: route.ConfigID, AccountID: route.AccountID, InboxID: inboxID, Known: true}
+	}
+	if h.legacyChatwootMode() {
+		return chatwootCorrelationScope{AccountID: route.AccountID, InboxID: inboxID, Legacy: true, Known: true}
+	}
+	for _, identifier := range deviceIdentifiers {
+		if strings.TrimSpace(identifier) == "" {
+			continue
+		}
+		rc := resolveChatwootScopeConfig(identifier)
+		if rc == nil || rc.Client == nil || rc.ConfigID <= 0 {
+			continue
+		}
+		if rc.Client.AccountID != payload.Account.ID || rc.Client.InboxID != payload.Conversation.InboxID {
+			logrus.Warnf("Chatwoot Webhook: device config %d does not match payload account %d inbox %d; correlation scope unconfirmed",
+				rc.ConfigID, payload.Account.ID, payload.Conversation.InboxID)
+			return chatwootCorrelationScope{}
+		}
+		return chatwootCorrelationScope{ConfigID: rc.ConfigID, AccountID: rc.Client.AccountID, InboxID: rc.Client.InboxID, Known: true}
+	}
+	logrus.Warnf("Chatwoot Webhook: no enabled device config for conversation %d (account=%d inbox=%d); correlation scope unconfirmed",
+		payload.Conversation.ID, payload.Account.ID, payload.Conversation.InboxID)
+	return chatwootCorrelationScope{}
+}
+
+// resolveChatwootScopeConfig resolves the config of the device that will send,
+// for confirmChatwootCorrelationScope. Unlike resolveChatwootForDevice it never
+// logs the identifier or the error text: the identifier can be the device's
+// phone JID, and a registry error can quote it.
+func resolveChatwootScopeConfig(identifier string) *chatwoot.ResolvedConfig {
+	reg := chatwoot.GetClientRegistry()
+	if reg == nil {
+		return nil
+	}
+	rc, err := reg.Resolve(identifier)
+	if err != nil {
+		logrus.Warn("Chatwoot Webhook: failed to resolve the sending device's Chatwoot config; trying the next identifier")
+		return nil
+	}
+	return rc
+}
+
+// chatwootMaxReplyMessageID is the largest quoted Chatwoot message id accepted:
+// it must fit in int on this architecture and be exactly representable in the
+// float64 that encoding/json produces for numbers in a map[string]any.
+const chatwootMaxReplyMessageID = min(math.MaxInt, 1<<53-1)
+
+// chatwootReplyExternalID returns the WhatsApp id carried by Chatwoot's
+// in_reply_to_external_id when it uses the shared "WAID:<id>" source-id form.
+func chatwootReplyExternalID(attrs map[string]any) (string, bool) {
+	raw, ok := attrs["in_reply_to_external_id"].(string)
+	if !ok {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "WAID:") {
+		return "", false
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(trimmed, "WAID:"))
+	return id, id != ""
+}
+
+// chatwootReplyNumericID validates Chatwoot's in_reply_to as decoded from JSON
+// (float64): a positive, finite integer no larger than
+// chatwootMaxReplyMessageID. Strings, booleans, objects, and lists are rejected.
+func chatwootReplyNumericID(raw any) (int, bool) {
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	if value <= 0 || value != math.Trunc(value) || value > float64(chatwootMaxReplyMessageID) {
+		return 0, false
+	}
+	return int(value), true
+}
+
+// resolveChatwootReplyMessageID maps the message an agent reply quotes in
+// Chatwoot to the WhatsApp message id to quote. A "WAID:<id>" external
+// reference wins over the numeric one: the message must be in the sending
+// device's local store and in the destination chat, and when it is not, the
+// reply is sent unquoted (the numeric reference is not tried). Otherwise the
+// numeric in_reply_to is resolved through the persistent link written when that
+// Chatwoot message was delivered or mirrored, within the confirmed correlation
+// scope, and the link's chat must match the reply's destination. Returns nil
+// (plain send) whenever the reference is absent or cannot be resolved safely.
+func (h *ChatwootHandler) resolveChatwootReplyMessageID(ctx context.Context, payload chatwoot.WebhookPayload, scope chatwootCorrelationScope, storageDeviceID, destinationChatJID string, client *whatsmeow.Client) *string {
+	attrs := payload.ContentAttributes
+	if attrs == nil {
+		return nil
+	}
+	if id, ok := chatwootReplyExternalID(attrs); ok {
+		return h.confirmChatwootExternalReply(ctx, payload, id, storageDeviceID, destinationChatJID, client)
+	}
+
+	quotedID, ok := chatwootReplyNumericID(attrs["in_reply_to"])
+	if !ok {
+		return nil
+	}
+	if h == nil || h.ChatStorageRepo == nil || !scope.Known || strings.TrimSpace(storageDeviceID) == "" ||
+		payload.Conversation.ID <= 0 || scope.AccountID <= 0 || scope.InboxID <= 0 {
+		return nil
+	}
+
+	link, err := h.ChatStorageRepo.GetChatwootMessageLinkForReply(domainChatStorage.ChatwootReplyLinkFilter{
+		DeviceID:               storageDeviceID,
+		ChatwootMessageID:      quotedID,
+		ChatwootConversationID: payload.Conversation.ID,
+		ChatwootAccountID:      scope.AccountID,
+		ChatwootInboxID:        scope.InboxID,
+		ChatwootConfigID:       scope.ConfigID,
+		AllowLegacyAccountZero: scope.Legacy && scope.ConfigID == 0,
+	})
+	if err != nil {
+		logrus.Warnf("Chatwoot Webhook: failed to resolve quoted Chatwoot message %d in conversation %d; sending without quote: %v",
+			quotedID, payload.Conversation.ID, err)
+		return nil
+	}
+	if link == nil {
+		return nil
+	}
+	waMessageID := strings.TrimSpace(link.WhatsAppMessageID)
+	if waMessageID == "" || !chatwootReplyChatMatches(ctx, client, link.WhatsAppChatJID, destinationChatJID) {
+		return nil
+	}
+	return &waMessageID
+}
+
+// confirmChatwootExternalReply accepts a "WAID:<id>" reference only when that
+// message is in the sending device's local store and belongs to the reply's
+// destination chat. The send usecase builds the quote from that stored message
+// (content and sender), so an unchecked id could quote another chat's message
+// to this customer; without the stored message it would not quote at all, so a
+// missing message, no repository, or a read error is a plain send too.
+func (h *ChatwootHandler) confirmChatwootExternalReply(ctx context.Context, payload chatwoot.WebhookPayload, waMessageID, storageDeviceID, destinationChatJID string, client *whatsmeow.Client) *string {
+	if h == nil || h.ChatStorageRepo == nil || strings.TrimSpace(storageDeviceID) == "" {
+		return nil
+	}
+	message, err := h.ChatStorageRepo.GetMessageByIDAndDevice(storageDeviceID, waMessageID)
+	if err != nil {
+		logrus.Warnf("Chatwoot Webhook: failed to read the quoted WhatsApp message for conversation %d; sending without quote: %v",
+			payload.Conversation.ID, err)
+		return nil
+	}
+	if message == nil {
+		logrus.Debugf("Chatwoot Webhook: quoted WhatsApp message for conversation %d is not in local storage; sending without quote",
+			payload.Conversation.ID)
+		return nil
+	}
+	if !chatwootReplyChatMatches(ctx, client, message.ChatJID, destinationChatJID) {
+		logrus.Warnf("Chatwoot Webhook: quoted WhatsApp message for conversation %d belongs to another chat; sending without quote",
+			payload.Conversation.ID)
+		return nil
+	}
+	return &waMessageID
+}
+
+// chatwootReplyChatMatches reports whether a link's chat is the reply's
+// destination chat. JIDs are compared in full (server included) as NonAD; an
+// @lid side is mapped to its phone JID only through the sending device's own
+// client. Equivalence that cannot be shown returns false.
+func chatwootReplyChatMatches(ctx context.Context, client *whatsmeow.Client, linkChatJID, destinationChatJID string) bool {
+	linked, ok := parseChatwootReplyChatJID(linkChatJID)
+	if !ok {
+		return false
+	}
+	destination, ok := parseChatwootReplyChatJID(destinationChatJID)
+	if !ok {
+		return false
+	}
+	if linked == destination {
+		return true
+	}
+	if client == nil || (linked.Server != types.HiddenUserServer && destination.Server != types.HiddenUserServer) {
+		return false
+	}
+	return chatwootReplyPhoneJID(ctx, linked, client).ToNonAD() ==
+		chatwootReplyPhoneJID(ctx, destination, client).ToNonAD()
+}
+
+// chatwootReplyPhoneJID maps an @lid JID to its phone JID through the client's
+// own LID store, and returns any other JID (or one without a mapping, or on a
+// lookup error) unchanged. It is whatsapp.NormalizeJIDFromLID without the
+// logging: that helper writes the LID and the phone JID to the log.
+func chatwootReplyPhoneJID(ctx context.Context, jid types.JID, client *whatsmeow.Client) types.JID {
+	if jid.Server != types.HiddenUserServer || client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return jid
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+	return pn
+}
+
+func parseChatwootReplyChatJID(raw string) (types.JID, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.Contains(raw, "@") {
+		return types.EmptyJID, false
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil || jid.User == "" || jid.Server == "" {
+		return types.EmptyJID, false
+	}
+	return jid.ToNonAD(), true
+}
+
 // HandleWebhook is the shared (legacy / single-webhook) Chatwoot endpoint. The
 // device is resolved from the payload (conversation link, contact attrs, inbox
 // map, or env fallback).
@@ -510,6 +745,18 @@ func (h *ChatwootHandler) deliverChatwootReply(c fiber.Ctx, payload chatwoot.Web
 	// agent signature once, so both the attachment caption and the text path use
 	// the same composed body.
 	outgoingText := composeOutgoingText(payload)
+	if len(payload.Attachments) == 0 && outgoingText == "" {
+		return c.SendStatus(fiber.StatusOK)
+	}
+
+	// Complete the correlation scope (config/account/inbox) for the device that
+	// will send, without changing the device, destination, or route precedence.
+	// The quoted-link lookup and the links written below both use this scope.
+	scope := h.confirmChatwootCorrelationScope(payload, route, resolvedID, storageDeviceID)
+
+	// Resolve the quoted WhatsApp message once; every request below carries it.
+	// nil means a plain send (no reference, or one that cannot be resolved).
+	replyMessageID := h.resolveChatwootReplyMessageID(ctx, payload, scope, storageDeviceID, linkChatJID, instance.GetClient())
 
 	// Handle attachments if present
 	if len(payload.Attachments) > 0 {
@@ -517,19 +764,21 @@ func (h *ChatwootHandler) deliverChatwootReply(c fiber.Ctx, payload chatwoot.Web
 		for i, attachment := range payload.Attachments {
 			// The caption belongs to the message as a whole, so it rides on the
 			// first attachment only — otherwise a multi-file reply repeats the
-			// same caption under every file.
+			// same caption under every file. The reply reference, by contrast,
+			// goes on every attachment: each one is a separate WhatsApp message,
+			// and a failed first attachment must not leave the rest unquoted.
 			caption := ""
 			if i == 0 {
 				caption = outgoingText
 			}
-			resp, err := h.handleAttachment(ctx, sendDestination, attachment, caption)
+			resp, err := h.handleAttachment(ctx, sendDestination, attachment, caption, replyMessageID)
 			if err != nil {
 				logrus.Errorf("Chatwoot Webhook: Failed to send attachment %d: %v", attachment.ID, err)
 				h.notifySendFailure(payload, route, fmt.Errorf("attachment %d failed: %w", attachment.ID, err))
 				continue
 			}
 			sentAny = true
-			h.storeChatwootOutboundLink(route, storageDeviceID, linkChatJID, payload, resp.MessageID)
+			h.storeChatwootOutboundLink(scope, storageDeviceID, linkChatJID, payload, resp.MessageID)
 		}
 		if sentAny {
 			h.markLatestInboundAsRead(c, storageDeviceID, linkChatJID)
@@ -541,7 +790,8 @@ func (h *ChatwootHandler) deliverChatwootReply(c fiber.Ctx, payload chatwoot.Web
 	// If content is present (and not just an attachment caption), send it as text
 	if outgoingText != "" {
 		req := domainSend.MessageRequest{
-			Message: outgoingText,
+			Message:        outgoingText,
+			ReplyMessageID: replyMessageID,
 		}
 		req.Phone = sendDestination
 
@@ -557,7 +807,7 @@ func (h *ChatwootHandler) deliverChatwootReply(c fiber.Ctx, payload chatwoot.Web
 			return c.SendStatus(fiber.StatusOK)
 		}
 		logrus.Infof("Chatwoot Webhook: Sent text message to %s", sendDestination)
-		h.storeChatwootOutboundLink(route, storageDeviceID, linkChatJID, payload, resp.MessageID)
+		h.storeChatwootOutboundLink(scope, storageDeviceID, linkChatJID, payload, resp.MessageID)
 		h.markLatestInboundAsRead(c, storageDeviceID, linkChatJID)
 	}
 
@@ -614,31 +864,33 @@ func (h *ChatwootHandler) handleDeletedChatwootMessage(c fiber.Ctx, payload chat
 	return c.SendStatus(fiber.StatusOK)
 }
 
-func (h *ChatwootHandler) storeChatwootOutboundLink(route chatwootWebhookRoute, deviceID, chatJID string, payload chatwoot.WebhookPayload, waMessageID string) {
+func (h *ChatwootHandler) storeChatwootOutboundLink(scope chatwootCorrelationScope, deviceID, chatJID string, payload chatwoot.WebhookPayload, waMessageID string) {
 	if h.ChatStorageRepo == nil || deviceID == "" || chatJID == "" || payload.ID == 0 || waMessageID == "" {
 		return
 	}
-	// Record the Chatwoot scope (config/account/inbox) this reply belongs to so
-	// future reverse lookups are account-scoped. Fall back to the payload's inbox
-	// when the route did not carry one (legacy single-account mode).
-	inboxID := route.InboxID
-	if inboxID == 0 {
-		inboxID = payload.Conversation.InboxID
+	// Without a confirmed scope the link would be written as a legacy (config 0)
+	// row in per-device mode; skip it rather than record a false legacy link.
+	// The WhatsApp delivery itself already happened and is unaffected.
+	if !scope.Known {
+		logrus.Warnf("Chatwoot Webhook: not storing outbound link for Chatwoot message %d: correlation scope unconfirmed", payload.ID)
+		return
 	}
+	// Record the Chatwoot scope (config/account/inbox) this reply belongs to so
+	// future reverse lookups are account-scoped.
 	if err := h.ChatStorageRepo.UpsertChatwootMessageLink(&domainChatStorage.ChatwootMessageLink{
 		DeviceID:                     deviceID,
 		WhatsAppMessageID:            waMessageID,
 		WhatsAppChatJID:              chatJID,
 		ChatwootMessageID:            payload.ID,
 		ChatwootConversationID:       payload.Conversation.ID,
-		ChatwootInboxID:              inboxID,
+		ChatwootInboxID:              scope.InboxID,
 		ChatwootContactInboxSourceID: chatJID,
 		SourceID:                     payload.SourceID,
 		Direction:                    "outgoing",
 		IsRead:                       true,
 		CreatedAt:                    time.Now(),
-		ChatwootConfigID:             route.ConfigID,
-		ChatwootAccountID:            route.AccountID,
+		ChatwootConfigID:             scope.ConfigID,
+		ChatwootAccountID:            scope.AccountID,
 	}); err != nil {
 		logrus.Errorf("Chatwoot Webhook: Failed to store outbound message link for Chatwoot %d / WhatsApp %s: %v", payload.ID, waMessageID, err)
 	}
@@ -726,13 +978,17 @@ func (h *ChatwootHandler) notifySendFailure(payload chatwoot.WebhookPayload, rou
 	}
 }
 
-func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, att chatwoot.Attachment, caption string) (domainSend.GenericResponse, error) {
+// handleAttachment sends one Chatwoot attachment. replyMessageID (nil for a
+// plain send) quotes the original WhatsApp message on every request, including
+// the audio-to-file fallback.
+func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, att chatwoot.Attachment, caption string, replyMessageID *string) (domainSend.GenericResponse, error) {
 	switch att.FileType {
 	case "image":
 		req := domainSend.ImageRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			Caption:     caption,
-			ImageURL:    &att.DataURL,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			Caption:        caption,
+			ImageURL:       &att.DataURL,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendImage(ctx, req)
 		if err == nil {
@@ -742,9 +998,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 
 	case "audio":
 		req := domainSend.AudioRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			AudioURL:    &att.DataURL,
-			PTT:         true, // Send as PTT (Voice Note) for better mobile experience
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			AudioURL:       &att.DataURL,
+			PTT:            true, // Send as PTT (Voice Note) for better mobile experience
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendAudio(ctx, req)
 		if err == nil {
@@ -755,9 +1012,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 		logrus.Warnf("Chatwoot Webhook: Failed to send as audio (%v), retrying as file...", err)
 		// Fallback to sending as file
 		reqFile := domainSend.FileRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			FileURL:     &att.DataURL,
-			Caption:     caption,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			FileURL:        &att.DataURL,
+			Caption:        caption,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err = h.SendUsecase.SendFile(ctx, reqFile)
 		if err == nil {
@@ -767,9 +1025,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 
 	case "video":
 		req := domainSend.VideoRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			Caption:     caption,
-			VideoURL:    &att.DataURL,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			Caption:        caption,
+			VideoURL:       &att.DataURL,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendVideo(ctx, req)
 		if err == nil {
@@ -780,9 +1039,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 	default:
 		// Default to file for other types
 		req := domainSend.FileRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			FileURL:     &att.DataURL,
-			Caption:     caption,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			FileURL:        &att.DataURL,
+			Caption:        caption,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendFile(ctx, req)
 		if err == nil {
